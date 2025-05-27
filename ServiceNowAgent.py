@@ -13,6 +13,7 @@ import time
 from google.api_core import exceptions, retry
 from dotenv import load_dotenv
 from email.mime.text import MIMEText
+from html.parser import HTMLParser
 
 # Load environment variables
 load_dotenv()
@@ -106,6 +107,32 @@ def analyze_email(email_content):
         log_action("Detected 'Change:' in email, assigning create_change action")
         return {'action': 'create_change', 'priority': 'normal', 'table': 'change_request', 'status': 'New'}
 
+    # Detect update commands (e.g., "Set ticket INC0010111 to Resolved")
+    if "set ticket" in email_content.lower():
+        import re
+        match = re.search(r"set ticket (\w{3}\d{7}) to (\w+)", email_content.lower())
+        if match:
+            ticket_number = match.group(1).upper()
+            status = match.group(2).capitalize()
+            comment_match = re.search(r"with comment: (.+)", email_content, re.IGNORECASE)
+            comment = comment_match.group(1) if comment_match else "Updated via email"
+            state_map = {
+                "New": "1", "In Progress": "2", "On Hold": "3",
+                "Resolved": "6", "Closed": "7", "Cancelled": "8"
+            }
+            if status in state_map:
+                log_action(f"Detected update for ticket {ticket_number} to {status}")
+                return {
+                    'action': 'update_ticket',
+                    'ticket_number': ticket_number,
+                    'table': 'incident' if ticket_number.startswith('INC') else 'change_request',
+                    'status': status,
+                    'comment': comment
+                }
+            else:
+                log_action(f"Invalid status {status} for ticket {ticket_number}")
+                return {'action': 'ignore', 'priority': 'normal', 'table': 'incident', 'status': 'New'}
+
     prompt = f"""
     Analyze this email content: "{email_content}"
     Return a JSON object with:
@@ -117,7 +144,6 @@ def analyze_email(email_content):
     - "Urgent: Printer broken" → {{"action": "create_incident", "priority": "high", "table": "incident", "status": "New"}}
     - "Change: Install software" → {{"action": "create_change", "priority": "normal", "table": "change_request", "status": "New"}}
     - "Working on it" → {{"action": "set_in_progress", "priority": "normal", "table": "incident", "status": "In Progress"}}
-    - "Approved" → {{"action": "approve", "priority": "normal", "table": "change_request", "status": "In Progress"}}
     """
     try:
         log_action("Analyzing email content with Gemini...")
@@ -172,16 +198,12 @@ def create_ticket(table, subject, description, priority):
         traceback.print_exc()
         return None, None
 
-def update_ticket(table, ticket_id, status, comment, priority='normal'):
+def update_ticket(table, ticket_number, status, comment, priority='normal'):
     try:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         state_map = {
-            "New": "1",
-            "In Progress": "2",
-            "On Hold": "3",
-            "Resolved": "6",
-            "Closed": "7",
-            "Cancelled": "8"
+            "New": "1", "In Progress": "2", "On Hold": "3",
+            "Resolved": "6", "Closed": "7", "Cancelled": "8"
         }
         data = {
             "state": state_map.get(status, "1"),
@@ -190,13 +212,13 @@ def update_ticket(table, ticket_id, status, comment, priority='normal'):
         }
         if table == "change_request" and status == "In Progress":
             data["approval"] = "approved"
-        url = f"{SNOW_URL}/{table}/{ticket_id}"
-        log_action(f"Updating {table} ticket {ticket_id} to {status}")
+        url = f"{SNOW_URL}/{table}/{ticket_number}"
+        log_action(f"Updating {table} ticket {ticket_number} to {status}")
         response = requests.patch(url, auth=(SNOW_USER, SNOW_PASS), headers=headers, json=data)
         if response.status_code == 200:
-            log_action(f"Updated {table} ticket {ticket_id} to {status}")
+            log_action(f"Updated {table} ticket {ticket_number} to {status}")
         else:
-            log_action(f"Error updating {table} ticket {ticket_id}: {response.status_code} - {response.text}")
+            log_action(f"Error updating {table} ticket {ticket_number}: {response.status_code} - {response.text}")
     except Exception as e:
         log_action(f"Error updating ticket: {e}")
         traceback.print_exc()
@@ -205,7 +227,7 @@ def send_approval_email(service, ticket_number, subject, description):
     try:
         log_action(f"Preparing approval email for ticket {ticket_number} to {MANAGER_EMAIL}")
         message = MIMEText(
-            f"Please review this change request:\n"
+            f"Please review this {('change request' if ticket_number.startswith('CHG') else 'incident')}:\n"
             f"Title: {subject}\n"
             f"Description: {description}\n\n"
             f"Reply 'Approved' or 'Denied' to this email."
@@ -239,6 +261,18 @@ def process_emails():
         log_action(f"Found {len(messages)} unread emails to process.")
         ticket_ids_file = os.path.join(BASE_DIR, 'ticket_ids.txt')
 
+        # Load existing ticket IDs (format: "Subject - TicketNumber")
+        existing_tickets = set()
+        if os.path.exists(ticket_ids_file):
+            with open(ticket_ids_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        # Extract ticket number from "Subject - TicketNumber"
+                        if ' - ' in line:
+                            ticket_number = line.split(' - ')[-1]
+                            existing_tickets.add(ticket_number)
+
         for i, msg in enumerate(messages):
             msg_id = msg['id']
             log_action(f"Processing email ID: {msg_id}")
@@ -261,8 +295,6 @@ def process_emails():
                     elif part['mimeType'] == 'text/html':
                         data = part['body'].get('data')
                         if data:
-                            # Basic HTML to text conversion (strip tags)
-                            from html.parser import HTMLParser
                             class HTMLStripper(HTMLParser):
                                 def __init__(self):
                                     super().__init__()
@@ -288,15 +320,27 @@ def process_emails():
 
             if action == "ignore":
                 log_action(f"Ignored email: {subject}")
-            elif action in ["create_incident", "create_change"]:
+            elif action == "create_incident" or action == "create_change":
                 ticket_id, ticket_number = create_ticket(table, subject, body, priority)
                 if ticket_id:
+                    # Check if ticket number already exists
+                    if ticket_number in existing_tickets:
+                        log_action(f"Skipping duplicate ticket number: {ticket_number}")
+                        service.users().messages().modify(userId='me', id=msg_id, body={'removeLabelIds': ['UNREAD']}).execute()
+                        continue
+                    # Write "Subject - TicketNumber" to ticket_ids.txt
                     with open(ticket_ids_file, 'a') as f:
-                        f.write(subject + '\n')
-                    if table == "change_request":
+                        f.write(f"{subject} - {ticket_number}\n")
+                    # Send approval email for change requests or high-priority incidents
+                    if table == "change_request" or (table == "incident" and priority == "high"):
                         send_approval_email(service, ticket_number, subject, body)
-            elif action in ["set_new", "set_in_progress", "set_on_hold", "set_resolved", "set_closed", "set_cancelled"]:
-                log_action(f"Update action requested but ticket ID extraction not implemented for email: {subject}")
+            elif action == "update_ticket":
+                ticket_number = analysis.get('ticket_number')
+                status = analysis.get('status')
+                comment = analysis.get('comment')
+                update_ticket(table, ticket_number, status, comment, priority)
+            elif action in ["set_new", "set_in_progress", "set_on_hold", 'set_resolved', "set_closed", "set_cancelled"]:
+                log_action(f"Update action {action} requested but ticket ID extraction not implemented for email: {subject}")
             elif action in ["approve", "deny"]:
                 log_action(f"Approval action '{action}' received for email: {subject}")
             else:
